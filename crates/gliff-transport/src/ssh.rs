@@ -36,8 +36,9 @@ pub struct SshStream {
     pub stdout: ChildStdout,
 }
 
-/// Spawn ssh. Compression is off (video is already compressed) and the socket
-/// asks for low-latency queuing. stderr is inherited so server logs reach the
+/// Spawn ssh. Compression is off (video is already compressed), the socket
+/// asks for low-latency queuing, and unknown host keys are accepted unless
+/// ssh config says otherwise. stderr is inherited so server logs reach the
 /// client's terminal.
 pub fn spawn_ssh(target: &SshTarget) -> std::io::Result<SshStream> {
     let mut cmd = ssh_command(target);
@@ -62,10 +63,14 @@ fn ssh_command(target: &SshTarget) -> Command {
         .arg("Compression=no")
         .arg("-o")
         .arg("IPQoS=lowdelay")
-        .args(&target.ssh_args)
-        .arg("--")
-        .arg(&target.host)
-        .arg(remote_command(target));
+        .args(&target.ssh_args);
+    // No terminal to answer the host-key prompt: trust a host on first
+    // connect, as typing "yes" would. A changed key still fails. Only when
+    // the user's ssh config leaves the default, since -o would override it.
+    if host_key_checking_is_default(target) {
+        cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    }
+    cmd.arg("--").arg(&target.host).arg(remote_command(target));
     if let Some(path) = &target.askpass {
         cmd.env("SSH_ASKPASS", path)
             .env("SSH_ASKPASS_REQUIRE", "force")
@@ -96,6 +101,25 @@ fn remote_command(target: &SshTarget) -> String {
 
 fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+/// Whether ssh's effective StrictHostKeyChecking for this host is the default
+/// `ask`, i.e. neither ssh config nor ssh_args set it.
+fn host_key_checking_is_default(target: &SshTarget) -> bool {
+    let Ok(out) = std::process::Command::new("ssh")
+        .arg("-G")
+        .args(&target.ssh_args)
+        .arg("--")
+        .arg(&target.host)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|l| l == "stricthostkeychecking ask")
 }
 
 #[cfg(test)]
