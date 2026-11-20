@@ -137,6 +137,8 @@ pub fn client_main() -> Result<()> {
     })
 }
 
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 async fn session<R, W>(rd: R, wr: W, host: &str, check: Option<u32>) -> Result<()>
 where
     R: AsyncRead + Unpin + 'static,
@@ -144,8 +146,9 @@ where
 {
     let mut reader = Framed::new(rd);
     let mut writer = Framed::new(wr);
-    writer
-        .write_msg(&ClientMsg::Hello {
+    tokio::time::timeout(
+        WRITE_TIMEOUT,
+        writer.write_msg(&ClientMsg::Hello {
             version: PROTOCOL_VERSION,
             keymap: if check.is_none() {
                 local_keymap().await?
@@ -162,8 +165,10 @@ where
                     .chain([FEATURE_CURSOR_IN_VIDEO.to_string()])
                     .collect(),
             },
-        })
-        .await?;
+        }),
+    )
+    .await
+    .context("network write timed out")??;
     let mut helper = if check.is_none() {
         Some(native::spawn(
             "app",
@@ -199,11 +204,24 @@ where
         });
     }
     let (out, mut outgoing) = mpsc::channel::<(ClientMsg, Bytes)>(64);
+    let queue = |msg, payload| {
+        // Waiting here would stop the loop from draining clipboard traffic,
+        // handling window close, or observing the network writer's deadline.
+        out.try_send((msg, payload)).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => anyhow::anyhow!("network send queue is full"),
+            mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("network writer stopped"),
+        })
+    };
     let mut writes = tokio::task::spawn_local(async move {
         while let Some((msg, payload)) = outgoing.recv().await {
-            writer.write_msg_with_payloads(&msg, &[&payload]).await?;
+            tokio::time::timeout(
+                WRITE_TIMEOUT,
+                writer.write_msg_with_payloads(&msg, &[&payload]),
+            )
+            .await
+            .context("network write timed out")??;
         }
-        Ok::<_, gliff_transport::Error>(())
+        Ok::<_, anyhow::Error>(())
     });
     let (incoming_tx, mut incoming) = mpsc::channel::<Result<(ServerMsg, Bytes)>>(8);
     let reads = tokio::task::spawn_local(async move {
@@ -239,29 +257,29 @@ where
             _ = heartbeat.tick() => {
                 // An idle Linux desktop sends no video after refinement.
                 // Ask for a reply so the response timeout measures liveness.
-                out.send((ClientMsg::Ping { t: now_ms() }, Bytes::new())).await?;
+                queue(ClientMsg::Ping { t: now_ms() }, Bytes::new())?;
             }
             _ = &mut deadline => bail!("server stopped responding for 20 seconds"),
             result = &mut writes => { result??; bail!("network writer stopped"); }
             ev = event_rx.recv(), if helper.is_some() => {
                 let ev = ev.context("window closed")??;
-                if ev["type"] == "bye" { out.send((ClientMsg::Bye, Bytes::new())).await?; break; }
-                if ev["type"] == "clipboard" { clipboard.local(&ev).await?; }
+                if ev["type"] == "bye" { let _ = queue(ClientMsg::Bye, Bytes::new()); break; }
+                if ev["type"] == "clipboard" { clipboard.try_local(&ev)?; }
                 else if ev["type"] == "paste" { clipboard.paste(&ev); }
                 else if ev["type"] == "keyboard_layout" {
                     let keymap = crate::keymap::from_event(&ev)?;
-                    out.send((ClientMsg::Keymap { keymap }, Bytes::new())).await?;
+                    queue(ClientMsg::Keymap { keymap }, Bytes::new())?;
                 }
-                else if let Some(msg) = input(&ev) { out.send((msg, Bytes::new())).await?; }
+                else if let Some(msg) = input(&ev) { queue(msg, Bytes::new())?; }
             }
-            Some((msg, payload)) = clips.recv() => { out.send((ClientMsg::from(msg), payload)).await?; }
+            Some((msg, payload)) = clips.recv() => { queue(ClientMsg::from(msg), payload)?; }
             _ = idle.tick(), if decoder.is_some() => {
                 let decoder: &mut gliff_sw::Decoder = decoder.as_mut().unwrap();
                 if decoder.has_pending() {
                     if let Some(frame) = decoder.flush()? {
                         show(&display_tx, helper.is_some(), frame, scale).await?;
                         frames += 1;
-                        out.send((ClientMsg::FrameAck { frame_id: last_id, decoded_at_ms: now_ms() }, Bytes::new())).await?;
+                        queue(ClientMsg::FrameAck { frame_id: last_id, decoded_at_ms: now_ms() }, Bytes::new())?;
                     }
                 }
             }
@@ -276,7 +294,7 @@ where
                             got_hello = true;
                             if helper.is_some() {
                                 let command = json!({"type":"cursor_mode", "embedded":cursor_in_video(session.headless, &features)});
-                                display_tx.send((native::EVENT, serde_json::to_vec(&command)?)).await?;
+                                display_tx.try_send((native::EVENT, serde_json::to_vec(&command)?)).context("window is no longer accepting updates")?;
                             }
                         }
                         ServerMsg::StreamConfig { codec, chroma, width, height, scale_milli, .. } => {
@@ -298,11 +316,11 @@ where
                             match decoder.decode(&payload[..data_len as usize], &payload[data_len as usize..]) {
                                 Ok(Some(frame)) => { show(&display_tx, helper.is_some(), frame, scale).await?; frames += 1; }
                                 Ok(None) => {}
-                                Err(e) => { tracing::warn!(error = %e, "decode failed; requesting keyframe"); out.send((ClientMsg::RequestKeyframe, Bytes::new())).await?; }
+                                Err(e) => { tracing::warn!(error = %e, "decode failed; requesting keyframe"); queue(ClientMsg::RequestKeyframe, Bytes::new())?; }
                             }
-                            out.send((ClientMsg::FrameAck { frame_id, decoded_at_ms: now_ms() }, Bytes::new())).await?;
+                            queue(ClientMsg::FrameAck { frame_id, decoded_at_ms: now_ms() }, Bytes::new())?;
                         }
-                        ServerMsg::Ping { t } => { out.send((ClientMsg::Pong { t }, Bytes::new())).await?; }
+                        ServerMsg::Ping { t } => { queue(ClientMsg::Pong { t }, Bytes::new())?; }
                         ServerMsg::Error { code, message, .. } => bail!("{}: {message}", if is_incompatible(code) { "incompatible server" } else { "server error" }),
                         _ => {}
                     }
@@ -310,7 +328,7 @@ where
             }
         }
         if check.is_some_and(|n| frames >= n) {
-            out.send((ClientMsg::Bye, Bytes::new())).await?;
+            let _ = queue(ClientMsg::Bye, Bytes::new());
             println!("PASS: decoded {frames} frames from {host}");
             break;
         }
@@ -661,6 +679,41 @@ mod tests {
         assert!(!cursor_in_video(false, &[])); // older mirrored server
         assert!(cursor_in_video(true, &[])); // older headless server
         assert!(cursor_in_video(false, &[FEATURE_CURSOR_IN_VIDEO.into()]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_peer_cannot_pin_the_session() -> Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for (pings, expected) in [
+                    (8, "network write timed out"),
+                    (128, "network send queue is full"),
+                ] {
+                    let (client, server) = tokio::io::duplex(16);
+                    let (rd, wr) = tokio::io::split(client);
+                    let (server_rd, server_wr) = tokio::io::split(server);
+                    let peer = tokio::task::spawn_local(async move {
+                        let mut reader = Framed::new(server_rd);
+                        let mut writer = Framed::new(server_wr);
+                        reader.read_msg::<ClientMsg>().await?;
+                        // Continue sending but never accept any client replies.
+                        for t in 0..pings {
+                            writer.write_msg(&ServerMsg::Ping { t }).await?;
+                        }
+                        std::future::pending::<gliff_transport::Result<()>>().await
+                    });
+                    let error = tokio::time::timeout(
+                        WRITE_TIMEOUT + Duration::from_secs(1),
+                        session(rd, wr, "stalled", Some(1)),
+                    )
+                    .await?
+                    .unwrap_err();
+                    peer.abort();
+                    assert!(error.to_string().contains(expected), "{error:#}");
+                }
+                Ok(())
+            })
+            .await
     }
 
     #[test]

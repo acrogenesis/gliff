@@ -435,6 +435,21 @@ impl Transfers {
             .map_err(|_| TransferError::PeerGone)
     }
 
+    /// Enqueue a message without blocking the loop that also drains this queue.
+    pub fn try_send(&self, msg: ClipboardMsg) -> Result<(), TransferError> {
+        self.inner
+            .borrow()
+            .out
+            .try_send((msg, Bytes::new()))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Closed(_) => TransferError::PeerGone,
+                mpsc::error::TrySendError::Full(_) => TransferError::Io(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "clipboard send queue is full",
+                )),
+            })
+    }
+
     fn send_later(&self, msg: ClipboardMsg) {
         let out = self.inner.borrow().out.clone();
         tokio::task::spawn_local(async move {

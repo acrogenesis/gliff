@@ -38,7 +38,16 @@ impl Bridge {
     pub fn take_outbound(&self) -> Outbound {
         self.out.borrow_mut().take().unwrap()
     }
+    pub fn try_local(&self, ev: &Value) -> Result<()> {
+        self.transfers.try_send(self.local_offer(ev))?;
+        Ok(())
+    }
+    #[cfg(any(target_os = "macos", test))]
     pub async fn local(&self, ev: &Value) -> Result<()> {
+        self.transfers.send(self.local_offer(ev)).await?;
+        Ok(())
+    }
+    fn local_offer(&self, ev: &Value) -> ClipboardMsg {
         let text = ev["text"]
             .as_str()
             .filter(|s| s.len() <= TEXT_LIMIT)
@@ -50,14 +59,11 @@ impl Bridge {
             vec![]
         };
         *self.text.borrow_mut() = text;
-        self.transfers
-            .send(ClipboardMsg::Offer {
-                serial: self.serial.get(),
-                mime_types: mimes,
-                files: vec![],
-            })
-            .await?;
-        Ok(())
+        ClipboardMsg::Offer {
+            serial: self.serial.get(),
+            mime_types: mimes,
+            files: vec![],
+        }
     }
     pub fn peer(&self, msg: ClipboardMsg, payload: Bytes) {
         match self.transfers.on_msg(msg, payload) {
