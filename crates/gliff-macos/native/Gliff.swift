@@ -498,7 +498,17 @@ final class RemoteView: NSView {
     override func mouseEntered(with e: NSEvent) { hovering = pictureRect.contains(convert(e.locationInWindow, from: nil)); released = false }
     override func mouseExited(with e: NSEvent) { hovering = false; release() }
     func button(_ e: NSEvent, _ down: Bool) {
-        if down { hovering = true; released = false; window?.makeFirstResponder(self); buttons.insert(e.buttonNumber) } else { buttons.remove(e.buttonNumber) }
+        if down {
+            guard image != nil, pictureRect.contains(convert(e.locationInWindow, from: nil)) else {
+                motion(e)
+                return
+            }
+            hovering = true; released = false
+            window?.makeFirstResponder(self)
+            buttons.insert(e.buttonNumber)
+        } else if buttons.remove(e.buttonNumber) == nil {
+            return
+        }
         motion(e); event(["type": "button", "button": e.buttonNumber, "pressed": down])
     }
     override func mouseDown(with e: NSEvent) { button(e, true) }

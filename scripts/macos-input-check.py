@@ -57,6 +57,19 @@ precondition(observedEvents.count == 1 && observedEvents[0]["pressed"] as? Bool 
 observedEvents.removeAll()
 view.keyDown(with: keyEvent(1))
 precondition(observedEvents.isEmpty, "letterbox key reached the host")
+func clickEvent(_ type: NSEvent.EventType, _ point: NSPoint) -> NSEvent {
+    NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+}
+let barPoint = NSPoint(x: 10, y: 10)
+let picturePoint = NSPoint(x: 50, y: 50)
+view.mouseDown(with: clickEvent(.leftMouseDown, barPoint))
+view.mouseUp(with: clickEvent(.leftMouseUp, barPoint))
+precondition(observedEvents.isEmpty && view.buttons.isEmpty, "letterbox click reached the host")
+view.mouseDown(with: clickEvent(.leftMouseDown, picturePoint))
+view.mouseUp(with: clickEvent(.leftMouseUp, barPoint))
+let clicks = observedEvents.filter { $0["type"] as? String == "button" }
+precondition(clicks.map { $0["pressed"] as! Bool } == [true, false], "a valid press was not released outside the picture")
+precondition(view.buttons.isEmpty)
 let app = NSApplication.shared
 let delegate = App()
 let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1470, height: 956), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
